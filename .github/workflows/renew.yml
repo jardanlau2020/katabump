@@ -1,0 +1,74 @@
+name: Katabump Auto Renew
+
+on:
+  schedule:
+    # 每日 UTC 02:00 = 北京時間 10:00
+    # 每日跑：未到續期窗口時腳本會讀到 "can't renew" 提示並提早結束（幾秒收工），
+    # 好處是 Turnstile 失敗後第二日自動再試，唔會等 3 日錯過到期。
+    - cron: '0 2 * * *'
+  workflow_dispatch: # 允許手動觸發
+
+jobs:
+  Renew-Katabump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ⚙ 設置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安裝系統依賴和 python 依賴
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: ⚙ 設置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash ./setup_proxy.sh
+
+      - name: 🚀 運行續期腳本
+        env:
+          KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+          KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python3 app.py
+
+      - name: 📸 上傳失敗截圖（排障用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-screenshots
+          path: |
+            *.png
+            latest_logs/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 🧹 清理舊的工作流運行記錄（保留最近 10 條）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 10 ]; then
+              echo "刪除運行記錄: $run_id"
+              gh run delete "$run_id" || true
+            fi
+          done
