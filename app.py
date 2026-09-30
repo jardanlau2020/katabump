@@ -28,8 +28,7 @@ def _short(text, limit=60):
 
 #  Telegram 推送模块
 def build_tg_text(status_icon, status_text, detail=""):
-    """瘦身版通知: 统计一行 + 该项目一行（一次只报一件事）"""
-    # 邮箱脱敏：保留用户名前2位和后2位，中间用****代替
+    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         if len(name) > 4:
@@ -37,7 +36,7 @@ def build_tg_text(status_icon, status_text, detail=""):
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****'
+        masked_email = EMAIL[:2] + '****' if EMAIL else "katabump"
 
     status = (status_text or "").strip()
     info = _short(detail)
@@ -45,22 +44,20 @@ def build_tg_text(status_icon, status_text, detail=""):
         info = ""
 
     if status_icon == "❌":
-        tag = "❌ " + (info or status)
-        counts = (0, 0, 1)
+        l1 = f"🚨 {masked_email} · 續期未完成"
+        reason = info or status or "執行失敗"
+        l2 = f"⚠️ {reason} · 請登入面板手動處理"
+        return f"{l1}\n{l2}"
     elif "未到" in status or status_icon == "⏳":
-        tag = "⏭️ 未可續" + (f" · {info}" if info else "")
-        counts = (0, 1, 0)
+        l1 = f"🟢 {masked_email} · 狀態良好"
+        detail_part = f"{info} · " if info else ""
+        l2 = f"ℹ️ {detail_part}未到續期窗口"
+        return f"{l1}\n{l2}"
     else:
-        tag = ("✅ 已續期" if "成功" in status else "✅ 已完成") + (f" · {info}" if info else "")
-        counts = (1, 0, 0)
-
-    lines = [
-        f"🎮 katabump ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
-        f"▪️ {masked_email} · {tag}",
-    ]
-    if counts[2]:
-        lines.append("⚠️ 睇 workflow log 排查")
-    return "\n".join(lines)
+        l1 = f"✅ {masked_email} · 成功續期"
+        detail_part = f"{info} · " if info else ""
+        l2 = f"ℹ️ {detail_part}服務已自動展期"
+        return f"{l1}\n{l2}"
 
 
 def send_tg_message(status_icon, status_text, detail=""):
