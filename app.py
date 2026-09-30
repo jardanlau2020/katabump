@@ -15,16 +15,20 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可
 
 BASE_URL = "https://dashboard.katabump.com"  # 网站链接
 
+def now_local():
+    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def _short(text, limit=60):
+    """压平换行 + 截短，避免通知被截断得乱"""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
 #  Telegram 推送模块
-def send_tg_message(status_icon, status_text, time_left=""):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
-        return
-
-    # 获取北京时间 (UTC+8)
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-
+def build_tg_text(status_icon, status_text, detail=""):
+    """瘦身版通知: 统计一行 + 该项目一行（一次只报一件事）"""
     # 邮箱脱敏：保留用户名前2位和后2位，中间用****代替
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
@@ -35,12 +39,36 @@ def send_tg_message(status_icon, status_text, time_left=""):
     else:
         masked_email = EMAIL[:2] + '****'
 
-    text = (
-        f"🇫🇷 katabump 续期通知\n\n"
-        f"{status_icon} {status_text}\n"
-        f"👤 续期账户: {masked_email}\n"
-        f"⏱️ 续期时间: {current_time_str}"
-    )
+    status = (status_text or "").strip()
+    info = _short(detail)
+    if info == "未知":
+        info = ""
+
+    if status_icon == "❌":
+        tag = "❌ " + (info or status)
+        counts = (0, 0, 1)
+    elif "未到" in status or status_icon == "⏳":
+        tag = "⏭️ 未可續" + (f" · {info}" if info else "")
+        counts = (0, 1, 0)
+    else:
+        tag = ("✅ 已續期" if "成功" in status else "✅ 已完成") + (f" · {info}" if info else "")
+        counts = (1, 0, 0)
+
+    lines = [
+        f"🎮 katabump ｜ {now_local()} ｜ ✅ {counts[0]} ｜ ⏭️ {counts[1]} ｜ ❌ {counts[2]}",
+        f"▪️ {masked_email} · {tag}",
+    ]
+    if counts[2]:
+        lines.append("⚠️ 睇 workflow log 排查")
+    return "\n".join(lines)
+
+
+def send_tg_message(status_icon, status_text, detail=""):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
+        return
+
+    text = build_tg_text(status_icon, status_text, detail)
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
