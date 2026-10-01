@@ -17,46 +17,40 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - name: 檢出
+        uses: actions/checkout@v7
 
-      - name: ⚙ 設置 Python
-        uses: actions/setup-python@v7
+      # 遷移說明：原先是手寫的 5 個步驟（setup-python / apt+pip / 代理 / 執行 / 上傳截圖），
+      # 現改用 renew-kit 的 composite action 統一收口：
+      #   · apt-packages   -> xvfb / xdotool / scrot / 中文字體 / jq（代理腳本要用 jq）
+      #   · pip-packages   -> seleniumbase / requests
+      #   · setup-command  -> 裝 chromedriver + 掛 sing-box 代理（結果寫入 $GITHUB_ENV）
+      #   · command        -> 用 xvfb-run 包住 headful 瀏覽器
+      #   · artifact-paths -> 失敗時上傳截圖與日誌，排障用
+      # 面板憑據經由本 step 的 env 傳入，composite action 會繼承。
+      # 續期結果語義（RENEWED / SKIPPED / UNKNOWN / TRANSIENT / FAILED）由 renewkit 統一裁決。
+      - name: 執行續期
+        uses: jardanlau2020/renew-kit/.github/actions/renew@main
         with:
-          python-version: '3.12'
-
-      - name: 🛠️ 安裝系統依賴和 python 依賴
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq
-          pip install seleniumbase requests
-          seleniumbase install chromedriver
-
-      - name: ⚙ 設置代理 (sing-box)
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: bash ./setup_proxy.sh
-
-      - name: 🚀 運行續期腳本
+          script: app.py
+          python-version: "3.12"
+          apt-packages: "xvfb x11-utils xdotool scrot fonts-noto-cjk jq"
+          pip-packages: "seleniumbase requests"
+          setup-command: |
+            seleniumbase install chromedriver || true
+            bash ./setup_proxy.sh || true
+          setup-continue-on-error: "true"
+          command: 'xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py'
+          artifact-paths: |
+            *.png
+            latest_logs/
+          artifact-name: failure-screenshots
         env:
           KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
           KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python3 app.py
-
-      - name: 📸 上傳失敗截圖（排障用）
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: failure-screenshots
-          path: |
-            *.png
-            latest_logs/
-          if-no-files-found: ignore
-          retention-days: 3
 
       - name: 🧹 清理舊的工作流運行記錄（保留最近 10 條）
         if: always()

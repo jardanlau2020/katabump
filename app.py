@@ -1,86 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""katabump 自动登录续期 —— 已迁移到 renew-kit。
 
-import os
-import time
+公共部分（结果分类 / Telegram / 报告排版 / 时间格式化 / 环境变量）交给 renewkit，
+本文件保留 selenium 浏览器自动化：Turnstile 处理、登录、续期提交流程。
+
+迁移带来的行为变化：
+    · 登录页加载不出表单、Cloudflare 拦截、Turnstile 连续失败 -> TRANSIENT，
+      exit 0 不标红（属上游或风控问题，次日排程自动重试）。
+    · 浏览器/驱动层异常 -> TRANSIENT（环境问题，非业务失败）。
+    · 只有「登录被拒」「找不到服务器条目」这类确定性失败才 FAILED。
+    · 续期提交后读不到明确提示 -> UNKNOWN（❓ 结果未确认，提醒留意，
+      但不算失败；原实现用 ℹ️ 含糊带过，看不出成没成）。
+    · 通知失败不再影响退出码。
+"""
 import subprocess
-import requests
+import time
+
 from seleniumbase import SB
 
-# 从环境变量获取账号密码和 TG 配置
-EMAIL        = os.environ.get("KATABUMP_EMAIL") or ""    # 登录邮箱
-PASSWORD     = os.environ.get("KATABUMP_PASSWORD") or "" # 账号密码
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可选)
+from renewkit import Outcome, RenewReport
+from renewkit import env
+from renewkit.report import shorten
+from renewkit.timeutil import now_local
 
-BASE_URL = "https://dashboard.katabump.com"  # 网站链接
+# 从环境变量获取账号密码（TG 由 renewkit.notify 自行读取）
+EMAIL = env.get("KATABUMP_EMAIL")
+PASSWORD = env.get("KATABUMP_PASSWORD")
 
-def now_local():
-    """北京时间 (UTC+8)，格式 MM-DD HH:MM（runner 係 UTC）"""
-    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
-
-
-def _short(text, limit=60):
-    """压平换行 + 截短，避免通知被截断得乱"""
-    s = " ".join((text or "").split())
-    return s if len(s) <= limit else s[:limit - 1] + "…"
+BASE_URL = "https://dashboard.katabump.com"
+SERVICE = "katabump"
 
 
-#  Telegram 推送模块
-def build_tg_text(status_icon, status_text, detail=""):
-    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****' if EMAIL else "katabump"
+def masked_account() -> str:
+    """脱敏后的账号名，用于报告标题。"""
+    if not EMAIL:
+        return SERVICE
+    if "@" in EMAIL:
+        name, domain = EMAIL.split("@", 1)
+        return f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else EMAIL
+    return EMAIL[:2] + "****"
 
-    status = (status_text or "").strip()
-    info = _short(detail)
-    if info == "未知":
-        info = ""
-
-    if status_icon == "❌":
-        l1 = f"🚨 {masked_email} · 續期未完成"
-        reason = info or status or "執行失敗"
-        l2 = f"⚠️ {reason} · 請登入面板手動處理"
-        return f"{l1}\n{l2}"
-    elif "未到" in status or status_icon == "⏳":
-        l1 = f"🟢 {masked_email} · 狀態良好"
-        detail_part = f"{info} · " if info else ""
-        l2 = f"ℹ️ {detail_part}未到續期窗口"
-        return f"{l1}\n{l2}"
-    else:
-        l1 = f"✅ {masked_email} · 成功續期"
-        detail_part = f"{info} · " if info else ""
-        l2 = f"ℹ️ {detail_part}服務已自動展期"
-        return f"{l1}\n{l2}"
-
-
-def send_tg_message(status_icon, status_text, detail=""):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
-        return
-
-    text = build_tg_text(status_icon, status_text, detail)
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text
-    }
-    
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            print("📩 Telegram 通知发送成功！")
-        else:
-            print(f"⚠️ Telegram 通知发送失败: {r.text}")
-    except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
 
 #  页面注入脚本
 _EXPAND_JS = """
@@ -269,7 +229,8 @@ def handle_turnstile(sb) -> bool:
     return False
 
 #  账户登录
-def login(sb) -> bool:
+def login(sb) -> tuple[bool, Outcome, str]:
+    """登录。返回 (是否成功, 失败分类, 说明)。"""
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
     time.sleep(8)
@@ -295,12 +256,11 @@ def login(sb) -> bool:
             sb.wait_for_element('input[type="Email"]', timeout=5)
         except Exception:
             print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
+            print(f"  当前 URL: {sb.get_current_url()}")
+            print(f"  当前标题: {sb.get_title() or ''}")
             sb.save_screenshot("login_load_fail.png")
-            return False
+            # 登录页根本打不开 = 站点/CF 问题，不是脚本错
+            return False, Outcome.TRANSIENT, "登录页未加载出表单（站点不可达或被 Cloudflare 拦截）"
 
     print("🍪 关闭可能的 Cookie 弹窗...")
     try:
@@ -312,10 +272,10 @@ def login(sb) -> bool:
     except Exception:
         pass
 
-    print(f"📧 填写邮箱...")
+    print("📧 填写邮箱...")
     js_fill_input(sb, 'input[type="email"]', EMAIL)
     time.sleep(1)
-    
+
     print("🔑 填写密码...")
     js_fill_input(sb, 'input[type="password"]', PASSWORD)
     time.sleep(3)
@@ -334,7 +294,7 @@ def login(sb) -> bool:
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
             sb.save_screenshot("login_turnstile_fail.png")
-            return False
+            return False, Outcome.TRANSIENT, "Turnstile 连续 6 次未通过（风控，次日自动重试）"
     else:
         print("ℹ️ 未检测到 Turnstile")
 
@@ -353,11 +313,12 @@ def login(sb) -> bool:
     page_title = sb.get_title() or ""
     if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
         print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
-        return True
-        
+        return True, Outcome.SKIPPED, ""
+
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
     sb.save_screenshot("login_failed.png")
-    return False
+    return False, Outcome.FAILED, "登录被拒或未跳转（请检查账号密码）"
+
 
 # ===== 自动续期流程 =====
 
@@ -370,17 +331,16 @@ def _read_alert(sb):
         return ""
 
 
-def _goto_server_detail(sb) -> bool:
-    """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
+def _goto_server_detail(sb) -> tuple[bool, Outcome, str]:
+    """在 Dashboard 首页查找并点击 See 进入服务器详情页。返回 (是否成功, 分类, 说明)。"""
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # 检查页面顶部是否已有"还无法续期"全局提示
+    # 页面顶部已有「还无法续期」全局提示 -> 未到窗口，不是错误
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
-        return False
+        return False, Outcome.SKIPPED, shorten(alert_text)
 
     # 多种选择器尝试查找 See 链接
     selectors = [
@@ -429,13 +389,13 @@ def _goto_server_detail(sb) -> bool:
         except Exception:
             pass
         sb.save_screenshot("servers_page_fail.png")
-        return False
+        return False, Outcome.FAILED, "未找到服务器条目或 See 链接"
 
     print("🖱️  点击 'See' 进入服务器详情页...")
     see_link.click()
     time.sleep(5)
     print(f"📄 当前页面: {sb.get_current_url()}")
-    return True
+    return True, Outcome.SKIPPED, ""
 
 
 def _open_renew_modal(sb) -> bool:
@@ -589,56 +549,55 @@ def _submit_renew(sb):
     time.sleep(8)
 
 
-def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+def _check_renew_result(sb) -> tuple[Outcome, str]:
+    """读页面 alert 提示，判断续期结果。返回 (Outcome, 说明)。"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
 
-    if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
-    else:
+    if not alert_text:
         print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        return Outcome.UNKNOWN, "未检测到明确提示，请留意下次运行"
+
+    print(f"📩 页面提示: {alert_text}")
+    low = alert_text.lower()
+    if "can't renew" in low or "unable" in low:
+        return Outcome.SKIPPED, shorten(alert_text)
+    if any(kw in low for kw in ("renewed", "success", "extended")):
+        return Outcome.RENEWED, shorten(alert_text)
+    return Outcome.UNKNOWN, shorten(alert_text)
 
 
-def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+def renew_server(sb) -> tuple[Outcome, str]:
+    """登录成功后调用：自动进入详情页 -> Renew -> 提交 -> 读结果。"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
-    if not _goto_server_detail(sb):
-        return
+    ok, outcome, detail = _goto_server_detail(sb)
+    if not ok:
+        return outcome, detail
 
     if not _open_renew_modal(sb):
-        return
-
-    # altcha_ok = _solve_altcha(sb)
-    # if not altcha_ok:
-    #     print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
+        return Outcome.UNKNOWN, "Renew 按钮或确认框未出现"
 
     _submit_renew(sb)
-    _check_renew_result(sb)
+    return _check_renew_result(sb)
 
 
 #  脚本执行入口 (可选代理)
-def main():
+def main() -> int:
     print("#" * 25)
     print("   katabump 自动登录续期")
     print("#" * 25)
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    report = RenewReport(SERVICE)
+    account = masked_account()
+
+    IS_PROXY = env.get("IS_PROXY", "false").lower() == "true"
+    proxy_str = env.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
     sb_kwargs = {"uc": True, "headless": False}
 
     if IS_PROXY:
@@ -646,21 +605,29 @@ def main():
         sb_kwargs["proxy"] = proxy_str
     else:
         print("🌐 未使用代理，直连访问")
-    
-    print("🚀 启动浏览器...")
-    with SB(**sb_kwargs) as sb:
-        # print("✅ 浏览器已启动")
-        try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"📍  当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
 
-        if login(sb):
-            renew_server(sb)   # 登录成功后自动续期
-        else:
-            print("\n❌ 登录失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
+    print("🚀 启动浏览器...")
+    try:
+        with SB(**sb_kwargs) as sb:
+            try:
+                sb.open("https://api.ip.sb/ip")
+                print(f"📍  当前出口IP: {sb.get_text('body')}")
+            except Exception:
+                pass
+
+            ok, outcome, reason = login(sb)
+            if not ok:
+                print(f"\n❌ 登录未成功：{reason}")
+                report.add(account, outcome, detail=reason)
+            else:
+                outcome, detail = renew_server(sb)
+                report.add(account, outcome, detail=detail)
+    except Exception as exc:
+        # 浏览器 / 驱动层面的异常：多为环境或上游问题，按上游故障处理
+        report.add(account, Outcome.TRANSIENT, detail=shorten(str(exc), 90))
+
+    return report.finish()
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
