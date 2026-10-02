@@ -29,11 +29,14 @@ jobs:
       #   · artifact-paths -> 失敗時上傳截圖與日誌，排障用
       # 面板憑據經由本 step 的 env 傳入，composite action 會繼承。
       # 續期結果語義（RENEWED / SKIPPED / UNKNOWN / TRANSIENT / FAILED）由 renewkit 統一裁決。
+      # renew-kit 釘在 tag 上（action 與 pip 兩處都要釘）：main 上出過一次 composite
+      # action 的語法錯（空 then 分支），所有跟 @main 的倉庫一起變紅。升級就改這兩個 v0.4.2。
       - name: 執行續期
-        uses: jardanlau2020/renew-kit/.github/actions/renew@main
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.4.2
         with:
           script: app.py
           python-version: "3.12"
+          renewkit-ref: v0.4.2
           apt-packages: "xvfb x11-utils xdotool scrot fonts-noto-cjk jq"
           pip-packages: "seleniumbase requests"
           setup-command: |
