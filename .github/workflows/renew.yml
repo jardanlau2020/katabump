@@ -32,11 +32,11 @@ jobs:
       # renew-kit 釘在 tag 上（action 與 pip 兩處都要釘）：main 上出過一次 composite
       # action 的語法錯（空 then 分支），所有跟 @main 的倉庫一起變紅。升級就改這兩個 v0.4.2。
       - name: 執行續期
-        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.4.2
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
           script: app.py
           python-version: "3.12"
-          renewkit-ref: v0.4.2
+          renewkit-ref: v0.5.3
           apt-packages: "xvfb x11-utils xdotool scrot fonts-noto-cjk jq"
           pip-packages: "seleniumbase requests"
           setup-command: |
