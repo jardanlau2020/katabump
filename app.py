@@ -8,8 +8,12 @@
 迁移带来的行为变化：
     · 登录页加载不出表单、Cloudflare 拦截、Turnstile 连续失败 -> TRANSIENT，
       exit 0 不标红（属上游或风控问题，次日排程自动重试）。
+    · 提交后 redirect 返 `?error=captcha`（Turnstile token 被服务端拒收）
+      -> TRANSIENT，且同一 run 内即刻重试最多 3 次（换 IP 通常即过）。
+      实证 2026-10-07：同一份 code，68.154.54.106 中招、20.40.223.126 一次过。
     · 浏览器/驱动层异常 -> TRANSIENT（环境问题，非业务失败）。
-    · 只有「登录被拒」「找不到服务器条目」这类确定性失败才 FAILED。
+    · 只有「登录被拒」「找不到服务器条目」这类确定性失败才 FAILED；
+      其中 `?error=credentials` 才真的是帐密不对，文案会写明。
     · 续期提交后读不到明确提示 -> UNKNOWN（❓ 结果未确认，提醒留意，
       但不算失败；原实现用 ℹ️ 含糊带过，看不出成没成）。
     · 通知失败不再影响退出码。
@@ -30,6 +34,16 @@ PASSWORD = env.get("KATABUMP_PASSWORD")
 
 BASE_URL = "https://dashboard.katabump.com"
 SERVICE = "katabump"
+
+# 登入層風控重試：Turnstile token 被服務端拒收（redirect 返
+# /auth/login?error=captcha）係**機房 IP 聲譽波動**，唔係帳密錯。
+# 實測 2026-10-07：同一份 code、同一組 secret ——
+#   09:13Z 出口 IP 68.154.54.106 → ?error=captcha（run 37592961199 紅）
+#   人手重跑換 IP 20.40.223.126 → 一次過 302 /dashboard（run 37594138457 綠）
+# 即係「換一轉即刻好」，所以同一 run 內重試係有效嘅，唔應該等第二日。
+LOGIN_MAX_ATTEMPTS = 3
+LOGIN_RETRY_WAIT = 5
+CAPTCHA_ERR_MARK = "error=captcha"
 
 
 def masked_account() -> str:
@@ -228,9 +242,9 @@ def handle_turnstile(sb) -> bool:
     print("  ❌ Turnstile 6 次均失败")
     return False
 
-#  账户登录
-def login(sb) -> tuple[bool, Outcome, str]:
-    """登录。返回 (是否成功, 失败分类, 说明)。"""
+#  账户登录（單次嘗試）
+def _login_once(sb) -> tuple[bool, Outcome, str]:
+    """單次登入嘗試。返回 (是否成功, 失败分类, 说明)。"""
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
     time.sleep(8)
@@ -317,7 +331,46 @@ def login(sb) -> tuple[bool, Outcome, str]:
 
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
     sb.save_screenshot("login_failed.png")
-    return False, Outcome.FAILED, "登录被拒或未跳转（请检查账号密码）"
+    return False, *_classify_login_failure(sb.get_current_url() or "")
+
+
+def _classify_login_failure(url: str) -> tuple[Outcome, str]:
+    """按登入後 URL 上嘅錯誤碼分類，唔好一律當「帳密錯」。
+
+    katabump 係 Laravel：驗證失敗會 redirect 返 /auth/login?error=xxx。
+    實測見到嘅碼：
+      · error=captcha     → Turnstile token 被服務端拒收（風控，機房 IP 波動）
+      · error=credentials → 服務端明確話帳密唔啱（先至係真 FAILED）
+    """
+    u = (url or "").lower()
+    if CAPTCHA_ERR_MARK in u:
+        return (Outcome.TRANSIENT,
+                "Turnstile 被服務端拒收（風控，非帳密問題）")
+    if "error=credentials" in u or "error=password" in u or "error=email" in u:
+        return Outcome.FAILED, "帳號或密碼錯誤（服務端明確拒絕）"
+    return Outcome.FAILED, "登录被拒或未跳转（请检查账号密码）"
+
+
+#  账户登录（含風控自動重試）
+def login(sb) -> tuple[bool, Outcome, str]:
+    """登入；TRANSIENT 類失敗（風控／站點未載入）喺同一 run 內自動重試。"""
+    last = (False, Outcome.FAILED, "未知錯誤")
+    for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            print(f"\n🔁 登入重試 {attempt}/{LOGIN_MAX_ATTEMPTS}"
+                  f"（上一轉：{last[2]}）")
+            time.sleep(LOGIN_RETRY_WAIT)
+        ok, outcome, reason = _login_once(sb)
+        if ok:
+            if attempt > 1:
+                print(f"✅ 第 {attempt} 次嘗試成功（風控重試生效）")
+            return True, Outcome.SKIPPED, ""
+        last = (ok, outcome, reason)
+        if outcome is not Outcome.TRANSIENT:
+            # 確定性失敗（例如服務端講明帳密唔啱），重試無意義
+            return last
+    print(f"\n⚠️ 已試 {LOGIN_MAX_ATTEMPTS} 次，最後一次：{last[2]}")
+    return last
 
 
 # ===== 自动续期流程 =====
