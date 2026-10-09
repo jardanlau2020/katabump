@@ -160,21 +160,18 @@ _ALTCHA_SOLVED_JS = """
 
 #  底层输入工具
 def js_fill_input(sb, selector: str, text: str):
-    safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
-    sb.execute_script(f"""
-    (function(){{
-        var el = document.querySelector('{selector}');
-        if (!el) return;
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-        if (nativeInputValueSetter) {{
-            nativeInputValueSetter.call(el, "{safe_text}");
-        }} else {{
-            el.value = "{safe_text}";
-        }}
-        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    }})()
-    """)
+    sb.execute_script("""
+    var el = document.querySelector(arguments[0]);
+    if (!el) return;
+    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(el, arguments[1]);
+    } else {
+        el.value = arguments[1];
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    """, selector, text)
 
 def _activate_window():
     for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
@@ -650,12 +647,14 @@ def main() -> int:
     account = masked_account()
 
     IS_PROXY = env.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = env.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    proxy_str = env.get("PROXY_SERVER", "").strip()
     sb_kwargs = {"uc": True, "headless": False}
 
-    if IS_PROXY:
+    if IS_PROXY and proxy_str:
         print(f"🔗 挂载代理: {proxy_str}")
         sb_kwargs["proxy"] = proxy_str
+    elif IS_PROXY:
+        print("⚠️ IS_PROXY=true 但 PROXY_SERVER 未设置，回退直连")
     else:
         print("🌐 未使用代理，直连访问")
 
