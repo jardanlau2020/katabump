@@ -17,9 +17,14 @@
     · 续期提交后读不到明确提示 -> UNKNOWN（❓ 结果未确认，提醒留意，
       但不算失败；原实现用 ℹ️ 含糊带过，看不出成没成）。
     · 通知失败不再影响退出码。
+    · 2026-10-13：登入頁新載 ALTCHA 腳本後，UC/CDP 模式的 `sb.execute_script`
+      會連頁面自身嘅 uncaught JS 異常一齊拋返（`exceptionId: …`），令「填郵箱」
+      一步炸掉整個 login（10-10~10-13 連 4 轉 TRANSIENT）。已改為
+      `_raw_js`（原生 driver.execute_script）+ `_fill_input`（原生 send_keys 為主）。
 """
 import subprocess
 import time
+import traceback
 
 from seleniumbase import SB
 
@@ -173,6 +178,57 @@ def js_fill_input(sb, selector: str, text: str):
     el.dispatchEvent(new Event('change', { bubbles: true }));
     """, selector, text)
 
+
+def _raw_js(sb, script, *args, default=None, label="頁面腳本"):
+    """用原生 WebDriver 執行頁面 JS（繞過 SeleniumBase 的 CDP 包裝）。
+
+    2026-10-13 起 katabump 登入頁多載了 ALTCHA 腳本（altcha.min.js /
+    altcha-progress.js），SeleniumBase UC/CDP 模式下 `sb.execute_script`
+    會連頁面自身嘅 uncaught JS 異常一齊拋返（訊息係 CDP dump：
+    `exceptionId: 1 text: Uncaught lineNumber: 1 columnNumber: 13 scriptId: 20 …`），
+    令「填郵箱」等非關鍵步驟意外炸掉整個 login
+    —— 10-10~10-13 連續 4 轉 TRANSIENT 跳過就係咁嚟。
+    原生 driver.execute_script 唔會收集頁面異常，行為穩定得多。
+    """
+    try:
+        return sb.driver.execute_script(script, *args)
+    except Exception as exc:
+        print(f"  ⚠️ {label} 執行異常（已忽略）：{shorten(str(exc), 80)}")
+        return default
+
+
+def _fill_input(sb, selector: str, text: str) -> bool:
+    """填表單欄位（原生 WebDriver 為主，JS setter 兜底）。
+
+    唔用 execute_script 做主路徑的原因見 `_raw_js`。katabump 登入表單係普通
+    HTML form（唔係 React 受控元件），send_keys 完全等效。
+    """
+    try:
+        el = sb.driver.find_element("css selector", selector)
+        el.clear()
+        el.send_keys(text)
+        got = el.get_attribute("value") or ""
+        if got == text:
+            return True
+        print(f"  ⚠️ 原生填寫後值唔符（{len(got)} vs {len(text)} 字），改用 JS setter")
+    except Exception as exc:
+        print(f"  ⚠️ 原生填寫失敗（{type(exc).__name__}）：{shorten(str(exc), 70)}")
+    try:
+        sb.driver.execute_script("""
+        var el = document.querySelector(arguments[0]);
+        if (!el) return false;
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        if (setter) { setter.call(el, arguments[1]); } else { el.value = arguments[1]; }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return el.value === arguments[1];
+        """, selector, text)
+        return True
+    except Exception as exc:
+        print(f"  ⚠️ JS setter 都失敗：{shorten(str(exc), 70)}")
+        return False
+
+
 def _activate_window():
     for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
         try:
@@ -204,20 +260,20 @@ def handle_turnstile(sb) -> bool:
     time.sleep(2)
 
     # 检查是否已静默通过
-    if sb.execute_script(_SOLVED_JS):
+    if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
         print("✅ 已静默通过")
         return True
 
     # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
     for _ in range(3):
-        try: sb.execute_script(_EXPAND_JS)
+        try: _raw_js(sb, _EXPAND_JS, label="展開 Turnstile")
         except Exception: pass
         time.sleep(0.5)
 
     # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
     # 该方法自动完成：检测验证码类型 → 定位 iframe → 计算坐标 → PyAutoGUI 平滑点击
     for attempt in range(6):
-        if sb.execute_script(_SOLVED_JS):
+        if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
 
@@ -230,7 +286,7 @@ def handle_turnstile(sb) -> bool:
         # 等待验证结果（最多 8 秒）
         for _ in range(16):
             time.sleep(0.5)
-            if sb.execute_script(_SOLVED_JS):
+            if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
                 print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
                 return True
 
@@ -250,7 +306,11 @@ def _login_once(sb) -> tuple[bool, Outcome, str]:
     print("⏳ 等待 Cloudflare 验证通过...")
     cf_passed = False
     for i in range(30):
-        page_src = sb.get_page_source() or ""
+        try:
+            page_src = sb.get_page_source() or ""
+        except Exception as exc:
+            print(f"  ⚠️ 讀頁面源碼失敗（已忽略）：{shorten(str(exc), 60)}")
+            page_src = ""
         if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
             cf_passed = True
             print(f"✅ Cloudflare 验证已通过（{i+1}s）")
@@ -284,18 +344,22 @@ def _login_once(sb) -> tuple[bool, Outcome, str]:
         pass
 
     print("📧 填写邮箱...")
-    js_fill_input(sb, 'input[type="email"]', EMAIL)
+    if not _fill_input(sb, 'input[type="email"]', EMAIL):
+        sb.save_screenshot("login_fill_email_fail.png")
+        return False, Outcome.TRANSIENT, "填寫郵箱欄位失敗（見 log 的 ⚠️ 行）"
     time.sleep(1)
 
     print("🔑 填写密码...")
-    js_fill_input(sb, 'input[type="password"]', PASSWORD)
+    if not _fill_input(sb, 'input[type="password"]', PASSWORD):
+        sb.save_screenshot("login_fill_password_fail.png")
+        return False, Outcome.TRANSIENT, "填寫密碼欄位失敗（見 log 的 ⚠️ 行）"
     time.sleep(3)
 
     # 等待 Turnstile 验证框出现（最多 10 秒）
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
     for i in range(10):
-        if sb.execute_script(_EXISTS_JS):
+        if _raw_js(sb, _EXISTS_JS, default=False, label="Turnstile 探測"):
             ts_found = True
             print(f"✅ 检测到 Turnstile（{i+1}s）")
             break
@@ -310,7 +374,14 @@ def _login_once(sb) -> tuple[bool, Outcome, str]:
         print("ℹ️ 未检测到 Turnstile")
 
     print("🖱️ 敲击回车提交表单...")
-    sb.press_keys('input[name="password"]', '\n')
+    try:
+        sb.press_keys('input[name="password"]', '\n')
+    except Exception as exc:
+        print(f"  ⚠️ 回車提交失敗（{type(exc).__name__}），改用點擊 #submit：{shorten(str(exc), 60)}")
+        try:
+            sb.driver.find_element("css selector", "#submit").click()
+        except Exception as exc2:
+            print(f"  ⚠️ 點擊 #submit 都失敗：{shorten(str(exc2), 60)}")
 
     print("⏳ 等待登录跳转...")
     for _ in range(12):
@@ -675,7 +746,23 @@ def main() -> int:
                 outcome, detail = renew_server(sb)
                 report.add(account, outcome, detail=detail)
     except Exception as exc:
-        # 浏览器 / 驱动层面的异常：多为环境或上游问题，按上游故障处理
+        # 瀏覽器 / 驅動層面的異常：多為環境或上游問題，按上游故障處理。
+        # 2026-10-13：加完整 traceback + 頁面快照，否則 TRANSIENT 跳過冇任何證據
+        # （renew-kit 只在 failure() 才上傳 artifact）。
+        print("\n⚠️ 未捕捉異常（完整 traceback，方便定位）：")
+        traceback.print_exc()
+        if "sb" in locals():
+            try:
+                sb.save_screenshot("crash_login.png")
+            except Exception:
+                pass
+            try:
+                html = sb.get_page_source() or ""
+                with open("crash_page.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"📄 已寫出 crash_page.html（{len(html)} 字）")
+            except Exception as exc2:
+                print(f"⚠️ 寫不出頁面 HTML：{shorten(str(exc2), 60)}")
         report.add(account, Outcome.TRANSIENT, detail=shorten(str(exc), 90))
 
     return report.finish()

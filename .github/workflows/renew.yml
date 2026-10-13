@@ -55,6 +55,23 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
+      # 2026-10-13 加：TRANSIENT 跳過（exit 0）唔會觸發 renew-kit 的 failure()
+      # 上傳，之前連續 4 轉跳過係零證據、無法定位。改為無論成敗都上傳。
+      - name: 📎 上傳排障產物（含 TRANSIENT 跳過）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-evidence
+          path: |
+            crash_page.html
+            crash_login.png
+            login_fill_email_fail.png
+            login_fill_password_fail.png
+            login_failed.png
+            login_turnstile_fail.png
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: 🧹 清理舊的工作流運行記錄（保留最近 10 條）
         if: always()
         env:
