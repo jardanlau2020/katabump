@@ -17,11 +17,17 @@
     · 续期提交后读不到明确提示 -> UNKNOWN（❓ 结果未确认，提醒留意，
       但不算失败；原实现用 ℹ️ 含糊带过，看不出成没成）。
     · 通知失败不再影响退出码。
-    · 2026-10-13：登入頁新載 ALTCHA 腳本後，UC/CDP 模式的 `sb.execute_script`
-      會連頁面自身嘅 uncaught JS 異常一齊拋返（`exceptionId: …`），令「填郵箱」
-      一步炸掉整個 login（10-10~10-13 連 4 轉 TRANSIENT）。已改為
-      `_raw_js`（原生 driver.execute_script）+ `_fill_input`（原生 send_keys 為主）。
+    · 2026-10-13 定案：10-10~10-13 連續 4 轉跳過**係我哋自己嘅 regression**，
+      唔關站方／IP 事 —— commit 4f7792b（10-09 20:45）把 js_fill_input 由
+      「字串插值」改成「execute_script(script, selector, text) 靠 arguments[] 傳值」。
+      UC 模式下 webdriver 係 disconnect 狀態，SeleniumBase 會把 execute_script
+      轉去 CDP（nodriver）執行，而 CDP evaluate **唔收額外參數** ⇒ `arguments[0]`
+      ReferenceError ⇒ 拋出 `exceptionId: 1 text: Uncaught …`，令「填郵箱」一步
+      炸掉整個 login。10-09 08:40 嗰轉成功係喺 commit 之前。
+      修法：填表單改走 `sb.type()`（SeleniumBase 官方 CDP 路徑），JS 只做兜底，
+      且用 json.dumps 產生安全 JS 字面量（單參數，唔靠 arguments[]）。
 """
+import json
 import subprocess
 import time
 import traceback
@@ -165,67 +171,44 @@ _ALTCHA_SOLVED_JS = """
 
 #  底层输入工具
 def js_fill_input(sb, selector: str, text: str):
-    sb.execute_script("""
-    var el = document.querySelector(arguments[0]);
-    if (!el) return;
-    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-    if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(el, arguments[1]);
-    } else {
-        el.value = arguments[1];
-    }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    """, selector, text)
+    """用頁面 JS 寫入欄位值（兜底用）。
 
-
-def _raw_js(sb, script, *args, default=None, label="頁面腳本"):
-    """用原生 WebDriver 執行頁面 JS（繞過 SeleniumBase 的 CDP 包裝）。
-
-    2026-10-13 起 katabump 登入頁多載了 ALTCHA 腳本（altcha.min.js /
-    altcha-progress.js），SeleniumBase UC/CDP 模式下 `sb.execute_script`
-    會連頁面自身嘅 uncaught JS 異常一齊拋返（訊息係 CDP dump：
-    `exceptionId: 1 text: Uncaught lineNumber: 1 columnNumber: 13 scriptId: 20 …`），
-    令「填郵箱」等非關鍵步驟意外炸掉整個 login
-    —— 10-10~10-13 連續 4 轉 TRANSIENT 跳過就係咁嚟。
-    原生 driver.execute_script 唔會收集頁面異常，行為穩定得多。
+    ⚠️ 必須係**單參數** script：UC 模式下 webdriver 係 disconnect 狀態，
+    SeleniumBase 會把 `sb.execute_script` 轉去 CDP（nodriver）執行，
+    而 CDP evaluate 唔收額外參數 —— 用 `arguments[0]` 會即刻 ReferenceError
+    （2026-10-09 commit 4f7792b 就係咁樣搞到 10-10~10-13 連 4 轉 TRANSIENT 跳過）。
+    值改用 json.dumps 產生 JS 字面量：引號 / backtick / ${} / 換行全部安全。
     """
-    try:
-        return sb.driver.execute_script(script, *args)
-    except Exception as exc:
-        print(f"  ⚠️ {label} 執行異常（已忽略）：{shorten(str(exc), 80)}")
-        return default
+    sel_lit = json.dumps(selector)
+    val_lit = json.dumps(text)
+    sb.execute_script("""
+    (function(){
+        var el = document.querySelector(%s);
+        if (!el) return 'no-el';
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        if (setter) { setter.call(el, %s); } else { el.value = %s; }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return el.value === %s ? 'ok' : 'mismatch';
+    })()
+    """ % (sel_lit, val_lit, val_lit, val_lit))
 
 
 def _fill_input(sb, selector: str, text: str) -> bool:
-    """填表單欄位（原生 WebDriver 為主，JS setter 兜底）。
-
-    唔用 execute_script 做主路徑的原因見 `_raw_js`。katabump 登入表單係普通
-    HTML form（唔係 React 受控元件），send_keys 完全等效。
+    """填表單欄位。主路徑用 SeleniumBase 官方 `sb.type()` ——
+    佢自己識別 UC/CDP 狀態並走 `cdp.type()`（見 base_case.update_text），
+    唔會踩到 `arguments[]` 嗰個坑；JS 只做兜底。
     """
     try:
-        el = sb.driver.find_element("css selector", selector)
-        el.clear()
-        el.send_keys(text)
-        got = el.get_attribute("value") or ""
-        if got == text:
-            return True
-        print(f"  ⚠️ 原生填寫後值唔符（{len(got)} vs {len(text)} 字），改用 JS setter")
-    except Exception as exc:
-        print(f"  ⚠️ 原生填寫失敗（{type(exc).__name__}）：{shorten(str(exc), 70)}")
-    try:
-        sb.driver.execute_script("""
-        var el = document.querySelector(arguments[0]);
-        if (!el) return false;
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-        if (setter) { setter.call(el, arguments[1]); } else { el.value = arguments[1]; }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        return el.value === arguments[1];
-        """, selector, text)
+        sb.type(selector, text, timeout=20)
         return True
     except Exception as exc:
-        print(f"  ⚠️ JS setter 都失敗：{shorten(str(exc), 70)}")
+        print(f"  ⚠️ sb.type 失敗（{type(exc).__name__}）：{shorten(str(exc), 70)}")
+    try:
+        js_fill_input(sb, selector, text)
+        return True
+    except Exception as exc:
+        print(f"  ⚠️ JS 兜底都失敗（{type(exc).__name__}）：{shorten(str(exc), 70)}")
         return False
 
 
@@ -260,20 +243,20 @@ def handle_turnstile(sb) -> bool:
     time.sleep(2)
 
     # 检查是否已静默通过
-    if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
+    if sb.execute_script(_SOLVED_JS):
         print("✅ 已静默通过")
         return True
 
     # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
     for _ in range(3):
-        try: _raw_js(sb, _EXPAND_JS, label="展開 Turnstile")
+        try: sb.execute_script(_EXPAND_JS)
         except Exception: pass
         time.sleep(0.5)
 
     # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
     # 该方法自动完成：检测验证码类型 → 定位 iframe → 计算坐标 → PyAutoGUI 平滑点击
     for attempt in range(6):
-        if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
+        if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
 
@@ -286,7 +269,7 @@ def handle_turnstile(sb) -> bool:
         # 等待验证结果（最多 8 秒）
         for _ in range(16):
             time.sleep(0.5)
-            if _raw_js(sb, _SOLVED_JS, default=False, label="Turnstile 已過檢查"):
+            if sb.execute_script(_SOLVED_JS):
                 print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
                 return True
 
@@ -359,7 +342,7 @@ def _login_once(sb) -> tuple[bool, Outcome, str]:
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
     for i in range(10):
-        if _raw_js(sb, _EXISTS_JS, default=False, label="Turnstile 探測"):
+        if sb.execute_script(_EXISTS_JS):
             ts_found = True
             print(f"✅ 检测到 Turnstile（{i+1}s）")
             break
@@ -379,7 +362,7 @@ def _login_once(sb) -> tuple[bool, Outcome, str]:
     except Exception as exc:
         print(f"  ⚠️ 回車提交失敗（{type(exc).__name__}），改用點擊 #submit：{shorten(str(exc), 60)}")
         try:
-            sb.driver.find_element("css selector", "#submit").click()
+            sb.click("#submit")
         except Exception as exc2:
             print(f"  ⚠️ 點擊 #submit 都失敗：{shorten(str(exc2), 60)}")
 
