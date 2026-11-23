@@ -1,12 +1,12 @@
-﻿name: Katabump Auto Renew
+name: Katabump Auto Renew
 
 on:
   schedule:
-    # 姣忔棩 UTC 02:00 = 鍖椾含鏅傞枔 10:00
-    # 姣忔棩璺戯細鏈埌绾屾湡绐楀彛鏅傝叧鏈渻璁€鍒?"can't renew" 鎻愮ず涓︽彁鏃╃祼鏉燂紙骞剧鏀跺伐锛夛紝
-    # 濂借檿鏄?Turnstile 澶辨晽寰岀浜屾棩鑷嫊鍐嶈│锛屽敂鏈冪瓑 3 鏃ラ尟閬庡埌鏈熴€?
+    # 每日 UTC 02:00 = 北京時間 10:00
+    # 每日跑：未到續期窗口時腳本會讀到 "can't renew" 提示並提早結束（幾秒收工），
+    # 好處是 Turnstile 失敗後第二日自動再試，唔會等 3 日錯過到期。
     - cron: '0 2 * * *'
-  workflow_dispatch: # 鍏佽ū鎵嬪嫊瑙哥櫦
+  workflow_dispatch: # 允許手動觸發
 
 jobs:
   Renew-Katabump:
@@ -17,21 +17,21 @@ jobs:
       contents: read
 
     steps:
-      - name: 妾㈠嚭
+      - name: 檢出
         uses: actions/checkout@v7
 
-      # 閬风Щ瑾槑锛氬師鍏堟槸鎵嬪鐨?5 鍊嬫椹燂紙setup-python / apt+pip / 浠ｇ悊 / 鍩疯 / 涓婂偝鎴湒锛夛紝
-      # 鐝炬敼鐢?renew-kit 鐨?composite action 绲变竴鏀跺彛锛?
-      #   路 apt-packages   -> xvfb / xdotool / scrot / 涓枃瀛楅珨 / jq锛堜唬鐞嗚叧鏈鐢?jq锛?
-      #   路 pip-packages   -> seleniumbase / requests
-      #   路 setup-command  -> 瑁?chromedriver + 鎺?sing-box 浠ｇ悊锛堢祼鏋滃鍏?$GITHUB_ENV锛?
-      #   路 command        -> 鐢?xvfb-run 鍖呬綇 headful 鐎忚鍣?
-      #   路 artifact-paths -> 澶辨晽鏅備笂鍌虫埅鍦栬垏鏃ヨ獙锛屾帓闅滅敤
-      # 闈㈡澘鎲戞摎缍撶敱鏈?step 鐨?env 鍌冲叆锛宑omposite action 鏈冪辜鎵裤€?
-      # 绾屾湡绲愭灉瑾炵京锛圧ENEWED / SKIPPED / UNKNOWN / TRANSIENT / FAILED锛夌敱 renewkit 绲变竴瑁佹焙銆?
-      # renew-kit 閲樺湪 tag 涓婏紙action 鑸?pip 鍏╄檿閮借閲橈級锛歮ain 涓婂嚭閬庝竴娆?composite
-      # action 鐨勮獮娉曢尟锛堢┖ then 鍒嗘敮锛夛紝鎵€鏈夎窡 @main 鐨勫€夊韩涓€璧疯畩绱呫€傚崌绱氬氨鏀归€欏叐鍊?v0.4.2銆?
-      - name: 鍩疯绾屾湡
+      # 遷移說明：原先是手寫的 5 個步驟（setup-python / apt+pip / 代理 / 執行 / 上傳截圖），
+      # 現改用 renew-kit 的 composite action 統一收口：
+      #   · apt-packages   -> xvfb / xdotool / scrot / 中文字體 / jq（代理腳本要用 jq）
+      #   · pip-packages   -> seleniumbase / requests
+      #   · setup-command  -> 裝 chromedriver + 掛 sing-box 代理（結果寫入 $GITHUB_ENV）
+      #   · command        -> 用 xvfb-run 包住 headful 瀏覽器
+      #   · artifact-paths -> 失敗時上傳截圖與日誌，排障用
+      # 面板憑據經由本 step 的 env 傳入，composite action 會繼承。
+      # 續期結果語義（RENEWED / SKIPPED / UNKNOWN / TRANSIENT / FAILED）由 renewkit 統一裁決。
+      # renew-kit 釘在 tag 上（action 與 pip 兩處都要釘）：main 上出過一次 composite
+      # action 的語法錯（空 then 分支），所有跟 @main 的倉庫一起變紅。升級就改這兩個 v0.4.2。
+      - name: 執行續期
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.6.0
         with:
           script: app.py
@@ -55,9 +55,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 2026-10-13 鍔狅細TRANSIENT 璺抽亷锛坋xit 0锛夊敂鏈冭Ц鐧?renew-kit 鐨?failure()
-      # 涓婂偝锛屼箣鍓嶉€ｇ簩 4 杞夎烦閬庝總闆惰瓑鎿氥€佺劇娉曞畾浣嶃€傛敼鐐虹劇璜栨垚鏁楅兘涓婂偝銆?
-      - name: 馃搸 涓婂偝鎺掗殰鐢㈢墿锛堝惈 TRANSIENT 璺抽亷锛?
+      # 2026-10-13 加：TRANSIENT 跳過（exit 0）唔會觸發 renew-kit 的 failure()
+      # 上傳，之前連續 4 轉跳過係零證據、無法定位。改為無論成敗都上傳。
+      - name: 📎 上傳排障產物（含 TRANSIENT 跳過）
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -72,7 +72,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: 馃Ч 娓呯悊鑸婄殑宸ヤ綔娴侀亱琛岃閷勶紙淇濈暀鏈€杩?10 姊濓級
+      - name: 🧹 清理舊的工作流運行記錄（保留最近 10 條）
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,8 +82,7 @@ jobs:
           for run_id in $runs; do
             count=$((count + 1))
             if [ $count -gt 10 ]; then
-              echo "鍒櫎閬嬭瑷橀寗: $run_id"
+              echo "刪除運行記錄: $run_id"
               gh run delete "$run_id" || true
             fi
           done
-
