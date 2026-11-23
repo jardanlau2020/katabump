@@ -28,9 +28,11 @@
       且用 json.dumps 產生安全 JS 字面量（單參數，唔靠 arguments[]）。
 """
 import json
+import re
 import subprocess
 import time
 import traceback
+from datetime import datetime
 
 from seleniumbase import SB
 
@@ -653,25 +655,71 @@ def _submit_renew(sb):
     time.sleep(8)
 
 
-def _check_renew_result(sb) -> tuple[Outcome, str]:
-    """读页面 alert 提示，判断续期结果。返回 (Outcome, 说明)。"""
+#: 到期日候选（跟着 expire 关键词走，避免把版权年份之类抓进来）
+_EXPIRY_PATTERNS = (
+    r"(?:expires?|expiry|expiration|due|renews?\s+on|valid\s+until|到期)"
+    r"[^0-9]{0,40}(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})",
+    r"(\d{4})-(\d{2})-(\d{2})[T ]\d{2}:\d{2}",
+)
+
+
+def _extract_expiry(sb):
+    """从页面源码抠到期日，返回 datetime 或 None。
+
+    2026-11-23 修假成功：续期成不成只看日期有没有后移，弹窗文案一律不当判据。
+    """
+    try:
+        text = sb.get_page_source() or ""
+    except Exception:
+        return None
+    best = None
+    for pat in _EXPIRY_PATTERNS:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            try:
+                a, b, c = m.group(1), m.group(2), m.group(3)
+                if len(a) == 4:
+                    d = datetime(int(a), int(b), int(c))
+                else:
+                    year = int(c)
+                    if year < 100:
+                        year += 2000
+                    first, second = int(a), int(b)
+                    if second > 12 >= first:      # 美式 MM/DD/YYYY
+                        month, day = first, second
+                    else:                          # 欧式 DD/MM/YYYY
+                        month, day = second, first
+                    d = datetime(year, month, day)
+            except (TypeError, ValueError):
+                continue
+            if best is None or d > best:
+                best = d
+    return best
+
+
+def _check_renew_result(sb, before, after) -> tuple[Outcome, str]:
+    """按「到期日是否后移」判定；弹窗文案只写日志，不参与判定。"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
+    note = shorten(alert_text) if alert_text else "无提示框"
+    if alert_text:
+        print(f"📩 页面提示（仅日志，不参与判定）: {alert_text}")
 
-    if not alert_text:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        return Outcome.UNKNOWN, "未检测到明确提示，请留意下次运行"
+    if before and after and after > before:
+        return Outcome.RENEWED, f"{before:%Y-%m-%d} → {after:%Y-%m-%d}"
 
-    print(f"📩 页面提示: {alert_text}")
-    low = alert_text.lower()
-    if "can't renew" in low or "unable" in low:
-        return Outcome.SKIPPED, shorten(alert_text)
-    if any(kw in low for kw in ("renewed", "success", "extended")):
-        return Outcome.RENEWED, shorten(alert_text)
-    return Outcome.UNKNOWN, shorten(alert_text)
+    if before and after and after == before:
+        if alert_text and any(k in alert_text.lower() for k in ("can't renew", "unable")):
+            return Outcome.SKIPPED, f"未到续期窗口（{before:%Y-%m-%d}）"
+        return Outcome.UNKNOWN, f"到期日未变（{before:%Y-%m-%d}）；弹窗: {note}"
+
+    return Outcome.UNKNOWN, (
+        "读不到到期日（before=%s, after=%s）；弹窗: %s"
+        % (before.strftime("%Y-%m-%d") if before else "未知",
+           after.strftime("%Y-%m-%d") if after else "未知", note)
+    )
 
 
 def renew_server(sb) -> tuple[Outcome, str]:
@@ -687,8 +735,20 @@ def renew_server(sb) -> tuple[Outcome, str]:
     if not _open_renew_modal(sb):
         return Outcome.UNKNOWN, "Renew 按钮或确认框未出现"
 
+    before = _extract_expiry(sb)
     _submit_renew(sb)
-    return _check_renew_result(sb)
+    after = _extract_expiry(sb)
+    for _ in range(2):
+        if before and after and after > before:
+            break
+        time.sleep(4)
+        try:
+            sb.refresh_page()
+        except Exception:
+            pass
+        time.sleep(2)
+        after = _extract_expiry(sb)
+    return _check_renew_result(sb, before, after)
 
 
 #  脚本执行入口 (可选代理)
