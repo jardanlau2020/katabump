@@ -14,8 +14,10 @@
     · 浏览器/驱动层异常 -> TRANSIENT（环境问题，非业务失败）。
     · 只有「登录被拒」「找不到服务器条目」这类确定性失败才 FAILED；
       其中 `?error=credentials` 才真的是帐密不对，文案会写明。
-    · 续期提交后读不到明确提示 -> UNKNOWN（❓ 结果未确认，提醒留意，
-      但不算失败；原实现用 ℹ️ 含糊带过，看不出成没成）。
+    · 续期结果以**到期日**为准（2026-11-23 改）：续期前后各读一次到期日，
+      只有 `after > before` 才算 RENEWED；弹窗文案只记日志。
+      读不到到期日 / 日期没变化 -> UNKNOWN，并由 main() 强制非零退出
+      （renewkit 只把 FAILED 当错，UNKNOWN 默认 exit 0 —— 那又是假绿）。
     · 通知失败不再影响退出码。
     · 2026-10-13 定案：10-10~10-13 連續 4 轉跳過**係我哋自己嘅 regression**，
       唔關站方／IP 事 —— commit 4f7792b（10-09 20:45）把 js_fill_input 由
@@ -32,7 +34,7 @@ import re
 import subprocess
 import time
 import traceback
-from datetime import datetime
+from datetime import date, timedelta
 
 from seleniumbase import SB
 
@@ -437,6 +439,95 @@ def _read_alert(sb):
         return ""
 
 
+_MONTHS = {name: idx for idx, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+#: 到期日所在行的关键词。命中这行的第一个日期才算「到期日」，
+#: 否则退到「全页只有一个日期」的兜底 —— 多于一概不猜（猜错就是假绿）。
+_EXPIRY_KEYS = ("expir", "renew", "due", "valid until", "next payment",
+                "到期", "wygaśni", "odnowien")
+
+
+def _page_text(sb) -> str:
+    """整页可见文本。get_text 失败时退回 innerText。"""
+    try:
+        return sb.get_text("body") or ""
+    except Exception:
+        pass
+    try:
+        return sb.execute_script(
+            "return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        return ""
+
+
+def _parse_one_date(s: str):
+    """从一段文本里抠第一个日期。支持 2026-11-25 / 25.11.2026 / 25/11/2026 /
+    25 Nov 2026 / Nov 25, 2026。解析不了返回 None。"""
+    m = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](20\d{2})", s)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(20\d{2})", s)
+    if m and _MONTHS.get(m.group(2).lower()):
+        try:
+            return date(int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)))
+        except ValueError:
+            return None
+    m = re.search(r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(20\d{2})", s)
+    if m and _MONTHS.get(m.group(1).lower()):
+        try:
+            return date(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_relative_days(s: str):
+    """「剩 3 天」这类相对写法 → today + N。"""
+    m = (re.search(r"\b(\d{1,3})\s*days?\s*(?:left|remaining)", s, re.I)
+         or re.search(r"\bin\s+(\d{1,3})\s*days?", s, re.I)
+         or re.search(r"\b(\d{1,3})\s*d\b", s, re.I))
+    if m:
+        try:
+            return date.today() + timedelta(days=int(m.group(1)))
+        except ValueError:
+            return None
+    return None
+
+
+def _read_expiry(sb):
+    """读服务器到期日；读不到返回 None（调用方据此判 UNKNOWN，不许猜）。"""
+    txt = _page_text(sb)
+    if not txt:
+        print("⚠️ 页面取不到文本，读不到到期日")
+        return None
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    for ln in lines:
+        low = ln.lower()
+        if any(k in low for k in _EXPIRY_KEYS):
+            dt = _parse_one_date(ln) or _parse_relative_days(ln)
+            if dt:
+                print(f"📅 到期日取自: {shorten(ln, 90)}")
+                return dt
+    # 兜底：全页只有一个日期时用它
+    found = sorted({d for d in (_parse_one_date(ln) for ln in lines) if d})
+    if len(found) == 1:
+        print(f"📅 到期日（全页唯一日期）: {found[0]}")
+        return found[0]
+    print(f"⚠️ 读不到到期日（候选日期 {len(found)} 个）")
+    return None
+
+
 def _goto_server_detail(sb) -> tuple[bool, Outcome, str]:
     """在 Dashboard 首页查找并点击 See 进入服务器详情页。返回 (是否成功, 分类, 说明)。"""
     print("\n🖥️  正在进入服务器续期页...")
@@ -655,75 +746,54 @@ def _submit_renew(sb):
     time.sleep(8)
 
 
-#: 到期日候选（跟着 expire 关键词走，避免把版权年份之类抓进来）
-_EXPIRY_PATTERNS = (
-    r"(?:expires?|expiry|expiration|due|renews?\s+on|valid\s+until|到期)"
-    r"[^0-9]{0,40}(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})",
-    r"(\d{4})-(\d{2})-(\d{2})[T ]\d{2}:\d{2}",
-)
+def _check_renew_result(sb, before) -> tuple[Outcome, str]:
+    """以**到期日**判续期结果。弹窗文案只记日志（「还不能续」这条除外）。
 
-
-def _extract_expiry(sb):
-    """从页面源码抠到期日，返回 datetime 或 None。
-
-    2026-11-23 修假成功：续期成不成只看日期有没有后移，弹窗文案一律不当判据。
+    before: 提交前的到期日（date 或 None）。判据：
+      · after > before           -> RENEWED
+      · 读不到 before/after      -> UNKNOWN（main() 会强制非零退出）
+      · after == before / 更早   -> UNKNOWN
     """
-    try:
-        text = sb.get_page_source() or ""
-    except Exception:
-        return None
-    best = None
-    for pat in _EXPIRY_PATTERNS:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            try:
-                a, b, c = m.group(1), m.group(2), m.group(3)
-                if len(a) == 4:
-                    d = datetime(int(a), int(b), int(c))
-                else:
-                    year = int(c)
-                    if year < 100:
-                        year += 2000
-                    first, second = int(a), int(b)
-                    if second > 12 >= first:      # 美式 MM/DD/YYYY
-                        month, day = first, second
-                    else:                          # 欧式 DD/MM/YYYY
-                        month, day = second, first
-                    d = datetime(year, month, day)
-            except (TypeError, ValueError):
-                continue
-            if best is None or d > best:
-                best = d
-    return best
-
-
-def _check_renew_result(sb, before, after) -> tuple[Outcome, str]:
-    """按「到期日是否后移」判定；弹窗文案只写日志，不参与判定。"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
-    note = shorten(alert_text) if alert_text else "无提示框"
     if alert_text:
-        print(f"📩 页面提示（仅日志，不参与判定）: {alert_text}")
+        print(f"📩 页面提示（仅记录，不作成功判据）: {alert_text}")
 
-    if before and after and after > before:
-        return Outcome.RENEWED, f"{before:%Y-%m-%d} → {after:%Y-%m-%d}"
+    low = alert_text.lower()
+    if "can't renew" in low or "unable" in low:
+        # 还没到窗口：这条文案本身就是判据（此时没有可比的日期）
+        return Outcome.SKIPPED, shorten(alert_text)
 
-    if before and after and after == before:
-        if alert_text and any(k in alert_text.lower() for k in ("can't renew", "unable")):
-            return Outcome.SKIPPED, f"未到续期窗口（{before:%Y-%m-%d}）"
-        return Outcome.UNKNOWN, f"到期日未变（{before:%Y-%m-%d}）；弹窗: {note}"
+    after = None
+    for attempt in (1, 2):
+        try:
+            sb.refresh()
+        except Exception:
+            pass
+        time.sleep(4 if attempt == 1 else 6)
+        after = _read_expiry(sb)
+        print(f"📅 第 {attempt} 次刷新后到期日: "
+              f"{after.isoformat() if after else '（读不到）'}")
+        if before and after and after > before:
+            break
 
-    return Outcome.UNKNOWN, (
-        "读不到到期日（before=%s, after=%s）；弹窗: %s"
-        % (before.strftime("%Y-%m-%d") if before else "未知",
-           after.strftime("%Y-%m-%d") if after else "未知", note)
-    )
+    if before is None or after is None:
+        return Outcome.UNKNOWN, (
+            "读不到到期日，无法确认是否续上（提示：%s）"
+            % (shorten(alert_text, 60) or "无"))
+    if after > before:
+        return Outcome.RENEWED, f"到期日 {before} → {after}"
+    if after == before:
+        return Outcome.UNKNOWN, (
+            f"到期日没变（{before}），提示：{shorten(alert_text, 60) or '无'}")
+    return Outcome.UNKNOWN, f"到期日反而变早（{before} → {after}）"
 
 
 def renew_server(sb) -> tuple[Outcome, str]:
-    """登录成功后调用：自动进入详情页 -> Renew -> 提交 -> 读结果。"""
+    """登录成功后调用：自动进入详情页 -> 读到期日 -> Renew -> 提交 -> 比日期。"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
@@ -732,23 +802,15 @@ def renew_server(sb) -> tuple[Outcome, str]:
     if not ok:
         return outcome, detail
 
+    before = _read_expiry(sb)
+    print(f"📅 续期前到期日: "
+          f"{before.isoformat() if before else '（读不到 → 结果会判 UNKNOWN）'}")
+
     if not _open_renew_modal(sb):
         return Outcome.UNKNOWN, "Renew 按钮或确认框未出现"
 
-    before = _extract_expiry(sb)
     _submit_renew(sb)
-    after = _extract_expiry(sb)
-    for _ in range(2):
-        if before and after and after > before:
-            break
-        time.sleep(4)
-        try:
-            sb.refresh_page()
-        except Exception:
-            pass
-        time.sleep(2)
-        after = _extract_expiry(sb)
-    return _check_renew_result(sb, before, after)
+    return _check_renew_result(sb, before)
 
 
 #  脚本执行入口 (可选代理)
@@ -808,7 +870,12 @@ def main() -> int:
                 print(f"⚠️ 寫不出頁面 HTML：{shorten(str(exc2), 60)}")
         report.add(account, Outcome.TRANSIENT, detail=shorten(str(exc), 90))
 
-    return report.finish()
+    code = report.finish()
+    # renewkit 只把 FAILED 当错（Outcome.is_error），UNKNOWN 默认 exit 0 ——
+    # 「读不到到期日 / 日期没变化」就变成假绿。本仓要求这类结果必须非零。
+    if code == 0 and any(r.outcome is Outcome.UNKNOWN for r in report.results):
+        code = 2
+    return code
 
 
 if __name__ == "__main__":
