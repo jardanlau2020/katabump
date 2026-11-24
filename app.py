@@ -38,7 +38,7 @@ from datetime import date, timedelta
 
 from seleniumbase import SB
 
-from renewkit import Outcome, RenewReport
+from renewkit import Outcome, RenewReport, verdict
 from renewkit import env
 from renewkit.report import shorten
 from renewkit.timeutil import now_local
@@ -869,6 +869,18 @@ def main() -> int:
             except Exception as exc2:
                 print(f"⚠️ 寫不出頁面 HTML：{shorten(str(exc2), 60)}")
         report.add(account, Outcome.TRANSIENT, detail=shorten(str(exc), 90))
+
+    # 落判据给 renew-kit 的 Gate 步骤读：本仓已用「到期日 after>before」判 RENEWED，
+    # 这里把同一结论写进判据文件，action 据此决定 run 颜色，杜绝假绿。
+    # UNKNOWN（读不到到期日 / 日期没变）在本仓要按失败处理，先升级为 FAILED 再落判据，
+    # 保证「判据文件」与下面的退出码口径一致。
+    effective = report.worst
+    unknown_only = effective is Outcome.UNKNOWN and not any(
+        r.outcome is Outcome.FAILED for r in report.results)
+    if unknown_only:
+        effective = Outcome.FAILED
+    detail = " | ".join(f"{r.name}:{r.outcome.value}" for r in report.results)
+    verdict.record(effective, detail=detail)
 
     code = report.finish()
     # renewkit 只把 FAILED 当错（Outcome.is_error），UNKNOWN 默认 exit 0 ——
